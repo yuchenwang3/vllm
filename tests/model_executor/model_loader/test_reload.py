@@ -885,7 +885,7 @@ class _ComposedLoaderLayer(torch.nn.Module):
     matching ``MambaMixer2`` where ``A`` is loaded as ``-exp(A_log)``.
     """
 
-    def __init__(self):
+    def __init__(self, *, direct_reload: bool):
         super().__init__()
         self.A = torch.nn.Parameter(torch.empty(4, dtype=torch.float32))
         self.D = torch.nn.Parameter(torch.ones(4))
@@ -895,13 +895,15 @@ class _ComposedLoaderLayer(torch.nn.Module):
         )
         self.D.weight_loader = default_weight_loader
         self.dt_bias.weight_loader = default_weight_loader
+        if not direct_reload:
+            self.quant_method = _DirectReloadMethod(supported=False)
 
 
 def test_layerwise_reload_composed_loader_does_not_drop_params(monkeypatch):
     # Regression test: a composed_weight_loader param (A) used to double-count
     # its elements, finalizing the layer before the trailing param (D) was
     # loaded and leaving it as uninitialized materialized memory.
-    layer = _ComposedLoaderLayer()
+    layer = _ComposedLoaderLayer(direct_reload=False)
     model = torch.nn.Sequential(layer)
 
     def materialize_with_sentinel(meta_tensor):
@@ -928,6 +930,8 @@ def test_layerwise_reload_composed_loader_does_not_drop_params(monkeypatch):
 
     record_metadata_for_reloading(model)
     initialize_layerwise_reload(model)
+    assert layer.A.is_meta
+    assert not get_layerwise_info(layer).runtime_bound
     # Mimic real load_weights: resolve params once, then load in checkpoint
     # order with D last (the param that was dropped).
     params = dict(layer.named_parameters())
@@ -939,6 +943,39 @@ def test_layerwise_reload_composed_loader_does_not_drop_params(monkeypatch):
     assert torch.equal(layer.A, -torch.exp(loaded["A"]))
     assert torch.equal(layer.dt_bias, loaded["dt_bias"])
     assert torch.equal(layer.D, loaded["D"])
+
+
+def test_direct_reload_handles_mamba_composed_loader():
+    layer = _ComposedLoaderLayer(direct_reload=True)
+    model = torch.nn.Sequential(layer)
+    original_ptrs = {name: param.data_ptr() for name, param in layer.named_parameters()}
+    loaded = {
+        "A": torch.full((4,), 0.5),
+        "dt_bias": torch.full((4,), 3.0),
+        "D": torch.full((4,), 7.0),
+    }
+
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+
+    assert get_layerwise_info(layer).runtime_bound
+    assert not any(param.is_meta for param in layer.parameters())
+    assert {
+        name: param.data_ptr() for name, param in layer.named_parameters()
+    } == original_ptrs
+
+    params = dict(layer.named_parameters())
+    for name in ("A", "dt_bias", "D"):
+        param = params[name]
+        param.weight_loader(param, loaded[name])
+    finalize_layerwise_reload(model, model_config=None)
+
+    assert torch.equal(layer.A, -torch.exp(loaded["A"]))
+    assert torch.equal(layer.dt_bias, loaded["dt_bias"])
+    assert torch.equal(layer.D, loaded["D"])
+    assert {
+        name: param.data_ptr() for name, param in layer.named_parameters()
+    } == original_ptrs
 
 
 class _RecordingQuantMethod(QuantizeMethodBase):
